@@ -15,6 +15,9 @@ import {
   GitPullRequestQueryType,
   CommentThreadContext,
   CommentThreadStatus,
+  GitBaseVersionDescriptor,
+  GitTargetVersionDescriptor,
+  GitVersionOptions,
 } from "azure-devops-node-api/interfaces/GitInterfaces.js";
 import { z } from "zod";
 import { getCurrentUserDetails, getUserIdFromEmail } from "./auth.js";
@@ -40,6 +43,7 @@ const REPO_TOOLS = {
   resolve_comment: "repo_resolve_comment",
   search_commits: "repo_search_commits",
   list_pull_requests_by_commits: "repo_list_pull_requests_by_commits",
+  get_branch_diff: "repo_get_branch_diff",
 };
 
 function branchesFilterOutIrrelevantProperties(branches: GitRef[], top: number) {
@@ -959,6 +963,92 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
             {
               type: "text",
               text: `Error querying pull requests by commits: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  const gitVersionOptionsStrings = Object.values(GitVersionOptions).filter((value): value is string => typeof value === "string");
+
+  server.tool(
+    REPO_TOOLS.get_branch_diff,
+    "Retrieve the diff between two branches in an Azure DevOps Git repository.",
+    {
+      project: z.string().describe("Project ID or project name"),
+      repositoryId: z.string().describe("The name or ID of the repository"),
+      baseVersion: z.string().describe("Version string identifier (name of tag/branch, SHA1 of commit) for the base version"),
+      targetVersion: z.string().describe("Version string identifier (name of tag/branch, SHA1 of commit) for the target version"),
+      baseVersionType: z
+        .enum(gitVersionTypeStrings as [string, ...string[]])
+        .optional()
+        .default(GitVersionType[GitVersionType.Branch])
+        .describe("Version type (branch, tag, or commit). Determines how baseVersion is interpreted"),
+      targetVersionType: z
+        .enum(gitVersionTypeStrings as [string, ...string[]])
+        .optional()
+        .default(GitVersionType[GitVersionType.Branch])
+        .describe("Version type (branch, tag, or commit). Determines how targetVersion is interpreted"),
+      baseVersionOptions: z
+        .enum(gitVersionOptionsStrings as [string, ...string[]])
+        .optional()
+        .describe("Version options - Specify additional modifiers to base version (e.g Previous)"),
+      targetVersionOptions: z
+        .enum(gitVersionOptionsStrings as [string, ...string[]])
+        .optional()
+        .describe("Version options - Specify additional modifiers to target version (e.g Previous)"),
+      diffCommonCommit: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("If true, diff between common and target commits. If false, diff between base and target commits."),
+      top: z.number().optional().default(100).describe("Maximum number of changes to return. Defaults to 100."),
+      skip: z.number().optional().default(0).describe("Number of changes to skip"),
+    },
+    async ({ project, repositoryId, baseVersion, targetVersion, baseVersionType, targetVersionType, baseVersionOptions, targetVersionOptions, diffCommonCommit, top, skip }) => {
+      try {
+        const connection = await connectionProvider();
+        const gitApi = await connection.getGitApi();
+
+        // Build base version descriptor
+        const baseVersionDescriptor: GitBaseVersionDescriptor = {
+          version: baseVersion,
+          versionType: GitVersionType[baseVersionType as keyof typeof GitVersionType],
+        };
+        if (baseVersionOptions) {
+          baseVersionDescriptor.versionOptions = GitVersionOptions[baseVersionOptions as keyof typeof GitVersionOptions];
+        }
+
+        // Build target version descriptor
+        const targetVersionDescriptor: GitTargetVersionDescriptor = {
+          version: targetVersion,
+          versionType: GitVersionType[targetVersionType as keyof typeof GitVersionType],
+        };
+        if (targetVersionOptions) {
+          targetVersionDescriptor.versionOptions = GitVersionOptions[targetVersionOptions as keyof typeof GitVersionOptions];
+        }
+
+        const commitDiffs = await gitApi.getCommitDiffs(
+          repositoryId,
+          project,
+          diffCommonCommit,
+          top,
+          skip,
+          baseVersionDescriptor,
+          targetVersionDescriptor
+        );
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(commitDiffs, null, 2) }],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error retrieving branch diff: ${error instanceof Error ? error.message : String(error)}`,
             },
           ],
           isError: true,
