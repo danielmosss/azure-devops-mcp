@@ -5,8 +5,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { AccessToken } from "@azure/identity";
 import { WebApi } from "azure-devops-node-api";
 import { configureRepoTools, REPO_TOOLS } from "../../../src/tools/repositories";
-import { PullRequestStatus, GitVersionType, GitPullRequestQueryType, CommentThreadStatus, GitVersionOptions } from "azure-devops-node-api/interfaces/GitInterfaces.js";
+import { PullRequestStatus, GitVersionType, GitPullRequestQueryType, CommentThreadStatus, GitVersionOptions, GitObjectType } from "azure-devops-node-api/interfaces/GitInterfaces.js";
 import { getCurrentUserDetails, getUserIdFromEmail } from "../../../src/tools/auth";
+
 
 // Mock the auth module
 jest.mock("../../../src/tools/auth", () => ({
@@ -40,6 +41,7 @@ describe("repos tools", () => {
     getCommits: jest.MockedFunction<(...args: unknown[]) => Promise<unknown>>;
     getPullRequestQuery: jest.MockedFunction<(...args: unknown[]) => Promise<unknown>>;
     getCommitDiffs: jest.MockedFunction<(...args: unknown[]) => Promise<unknown>>;
+    getFileDiffs: jest.MockedFunction<(...args: unknown[]) => Promise<unknown>>;
   };
 
   beforeEach(() => {
@@ -66,6 +68,7 @@ describe("repos tools", () => {
       getCommits: jest.fn(),
       getPullRequestQuery: jest.fn(),
       getCommitDiffs: jest.fn(),
+      getFileDiffs: jest.fn(),
     };
 
     connectionProvider = jest.fn().mockResolvedValue({
@@ -3532,159 +3535,7 @@ describe("repos tools", () => {
     });
   });
 
-  describe("repo_get_branch_diff", () => {
-    it("should retrieve diff between two branches", async () => {
-      configureRepoTools(server, tokenProvider, connectionProvider, userAgentProvider);
 
-      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === REPO_TOOLS.get_branch_diff);
 
-      if (!call) throw new Error("repo_get_branch_diff tool not registered");
-      const [, , , handler] = call;
 
-      const mockCommitDiffs = {
-        allChangesIncluded: true,
-        changeCounts: {
-          Add: 2,
-          Edit: 1,
-        },
-        changes: [
-          {
-            item: {
-              gitObjectType: "blob",
-              commitId: "abc123",
-              path: "/file1.txt",
-              url: "https://dev.azure.com/org/project/_apis/git/repositories/repo123/items/file1.txt",
-            },
-            changeType: "add",
-          },
-          {
-            item: {
-              gitObjectType: "blob",
-              commitId: "def456",
-              path: "/file2.txt",
-              url: "https://dev.azure.com/org/project/_apis/git/repositories/repo123/items/file2.txt",
-            },
-            changeType: "edit",
-          },
-        ],
-        commonCommit: "base123",
-        baseCommit: "base123",
-        targetCommit: "target456",
-        aheadCount: 2,
-        behindCount: 0,
-      };
-
-      mockGitApi.getCommitDiffs.mockResolvedValue(mockCommitDiffs);
-
-      const params = {
-        project: "TestProject",  
-        repositoryId: "repo123",
-        baseVersion: "main",
-        targetVersion: "feature-branch",
-        baseVersionType: "Branch",
-        targetVersionType: "Branch",
-        diffCommonCommit: false,
-        top: 100,
-        skip: 0,
-      };
-
-      const result = await handler(params);
-
-      expect(mockGitApi.getCommitDiffs).toHaveBeenCalledWith(
-        "repo123",
-        "TestProject",
-        false,
-        100,
-        0,
-        expect.objectContaining({
-          version: "main",
-          versionType: GitVersionType.Branch,
-        }),
-        expect.objectContaining({
-          version: "feature-branch",
-          versionType: GitVersionType.Branch,
-        })
-      );
-      expect(result.content[0].text).toBe(JSON.stringify(mockCommitDiffs, null, 2));
-    });
-
-    it("should handle diff with common commit and version options", async () => {
-      configureRepoTools(server, tokenProvider, connectionProvider, userAgentProvider);
-
-      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === REPO_TOOLS.get_branch_diff);
-
-      if (!call) throw new Error("repo_get_branch_diff tool not registered");
-      const [, , , handler] = call;
-
-      const mockCommitDiffs = {
-        allChangesIncluded: true,
-        changeCounts: { Edit: 3 },
-        changes: [],
-        commonCommit: "common123",
-        aheadCount: 5,
-        behindCount: 2,
-      };
-
-      mockGitApi.getCommitDiffs.mockResolvedValue(mockCommitDiffs);
-
-      const params = {
-        project: "TestProject",
-        repositoryId: "repo123", 
-        baseVersion: "commit123",
-        targetVersion: "commit456",
-        baseVersionType: "Commit",
-        targetVersionType: "Commit",
-        baseVersionOptions: "PreviousChange",
-        targetVersionOptions: "FirstParent",
-        diffCommonCommit: true,
-        top: 50,
-        skip: 10,
-      };
-
-      const result = await handler(params);
-
-      expect(mockGitApi.getCommitDiffs).toHaveBeenCalledWith(
-        "repo123",
-        "TestProject",
-        true,
-        50,
-        10,
-        expect.objectContaining({
-          version: "commit123",
-          versionType: GitVersionType.Commit,
-          versionOptions: expect.any(Number),
-        }),
-        expect.objectContaining({
-          version: "commit456", 
-          versionType: GitVersionType.Commit,
-          versionOptions: expect.any(Number),
-        })
-      );
-      expect(result.content[0].text).toBe(JSON.stringify(mockCommitDiffs, null, 2));
-    });
-
-    it("should handle errors when retrieving branch diff", async () => {
-      configureRepoTools(server, tokenProvider, connectionProvider, userAgentProvider);
-
-      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === REPO_TOOLS.get_branch_diff);
-
-      if (!call) throw new Error("repo_get_branch_diff tool not registered");
-      const [, , , handler] = call;
-
-      const error = new Error("Failed to get commit diffs");
-      mockGitApi.getCommitDiffs.mockRejectedValue(error);
-
-      const params = {
-        project: "TestProject",
-        repositoryId: "repo123",
-        baseVersion: "main",
-        targetVersion: "feature",
-      };
-
-      const result = await handler(params);
-
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toBe("Error retrieving branch diff: Failed to get commit diffs");
-    });
-  });
 });

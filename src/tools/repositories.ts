@@ -18,6 +18,9 @@ import {
   GitBaseVersionDescriptor,
   GitTargetVersionDescriptor,
   GitVersionOptions,
+  FileDiffsCriteria,
+  FileDiffParams,
+  GitObjectType,
 } from "azure-devops-node-api/interfaces/GitInterfaces.js";
 import { z } from "zod";
 import { getCurrentUserDetails, getUserIdFromEmail } from "./auth.js";
@@ -43,7 +46,7 @@ const REPO_TOOLS = {
   resolve_comment: "repo_resolve_comment",
   search_commits: "repo_search_commits",
   list_pull_requests_by_commits: "repo_list_pull_requests_by_commits",
-  get_branch_diff: "repo_get_branch_diff",
+  get_current_branch_changes: "repo_get_current_branch_changes",
 };
 
 function branchesFilterOutIrrelevantProperties(branches: GitRef[], top: number) {
@@ -973,82 +976,243 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
 
   const gitVersionOptionsStrings = Object.values(GitVersionOptions).filter((value): value is string => typeof value === "string");
 
+
+
+
+
   server.tool(
-    REPO_TOOLS.get_branch_diff,
-    "Retrieve the diff between two branches in an Azure DevOps Git repository.",
+    REPO_TOOLS.get_current_branch_changes,
+    "Get detailed line-by-line changes between branches, showing exactly what code has been added, modified, or deleted. Returns the actual changed lines of code for reviewing against developer checklists before creating PRs. Based on Azure DevOps diffs/commits API.",
     {
       project: z.string().describe("Project ID or project name"),
       repositoryId: z.string().describe("The name or ID of the repository"),
-      baseVersion: z.string().describe("Version string identifier (name of tag/branch, SHA1 of commit) for the base version"),
-      targetVersion: z.string().describe("Version string identifier (name of tag/branch, SHA1 of commit) for the target version"),
-      baseVersionType: z
-        .enum(gitVersionTypeStrings as [string, ...string[]])
+      currentBranch: z.string().describe("The current feature branch name (e.g., 'feature/my-feature')"),
+      targetBranch: z
+        .string()
         .optional()
-        .default(GitVersionType[GitVersionType.Branch])
-        .describe("Version type (branch, tag, or commit). Determines how baseVersion is interpreted"),
-      targetVersionType: z
-        .enum(gitVersionTypeStrings as [string, ...string[]])
-        .optional()
-        .default(GitVersionType[GitVersionType.Branch])
-        .describe("Version type (branch, tag, or commit). Determines how targetVersion is interpreted"),
-      baseVersionOptions: z
-        .enum(gitVersionOptionsStrings as [string, ...string[]])
-        .optional()
-        .describe("Version options - Specify additional modifiers to base version (e.g Previous)"),
-      targetVersionOptions: z
-        .enum(gitVersionOptionsStrings as [string, ...string[]])
-        .optional()
-        .describe("Version options - Specify additional modifiers to target version (e.g Previous)"),
-      diffCommonCommit: z
+        .default("master")
+        .describe("The target branch to compare against (usually 'main' or 'master')"),
+      includeContent: z
         .boolean()
         .optional()
-        .default(false)
-        .describe("If true, diff between common and target commits. If false, diff between base and target commits."),
-      top: z.number().optional().default(100).describe("Maximum number of changes to return. Defaults to 100."),
-      skip: z.number().optional().default(0).describe("Number of changes to skip"),
+        .default(true)
+        .describe("Include actual file content differences (line-by-line diffs)"),
+      maxFilesToProcess: z
+        .number()
+        .optional()
+        .default(100)
+        .describe("Maximum number of files to process for detailed diffs"),
     },
-    async ({ project, repositoryId, baseVersion, targetVersion, baseVersionType, targetVersionType, baseVersionOptions, targetVersionOptions, diffCommonCommit, top, skip }) => {
+    async ({ project, repositoryId, currentBranch, targetBranch, includeContent, maxFilesToProcess }) => {
       try {
         const connection = await connectionProvider();
         const gitApi = await connection.getGitApi();
 
-        // Build base version descriptor
-        const baseVersionDescriptor: GitBaseVersionDescriptor = {
-          version: baseVersion,
-          versionType: GitVersionType[baseVersionType as keyof typeof GitVersionType],
-        };
-        if (baseVersionOptions) {
-          baseVersionDescriptor.versionOptions = GitVersionOptions[baseVersionOptions as keyof typeof GitVersionOptions];
+        // Get the current branch commit
+        const currentBranchRef = await gitApi.getBranch(repositoryId, currentBranch, project);
+        if (!currentBranchRef || !currentBranchRef.commit?.commitId) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Branch '${currentBranch}' not found in repository ${repositoryId}`,
+              },
+            ],
+            isError: true,
+          };
         }
 
-        // Build target version descriptor
-        const targetVersionDescriptor: GitTargetVersionDescriptor = {
-          version: targetVersion,
-          versionType: GitVersionType[targetVersionType as keyof typeof GitVersionType],
-        };
-        if (targetVersionOptions) {
-          targetVersionDescriptor.versionOptions = GitVersionOptions[targetVersionOptions as keyof typeof GitVersionOptions];
+        // Get the target branch commit
+        const targetBranchRef = await gitApi.getBranch(repositoryId, targetBranch, project);
+        if (!targetBranchRef || !targetBranchRef.commit?.commitId) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Target branch '${targetBranch}' not found in repository ${repositoryId}`,
+              },
+            ],
+            isError: true,
+          };
         }
 
+        const currentCommitId = currentBranchRef.commit.commitId;
+        const targetCommitId = targetBranchRef.commit.commitId;
+
+        // If branches are the same, no changes
+        if (currentCommitId === targetCommitId) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  summary: {
+                    message: `No changes - branch '${currentBranch}' is up to date with '${targetBranch}'`,
+                    currentBranch: currentBranch,
+                    targetBranch: targetBranch,
+                    currentCommit: currentCommitId,
+                    targetCommit: targetCommitId,
+                    totalFiles: 0,
+                  },
+                  fileChanges: [],
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        // Get the commit diffs between target branch and current branch
+        // Updated to use branch names directly (baseVersion=master&targetVersion=copilot pattern)
+        // and enable content diffs to get actual line changes
         const commitDiffs = await gitApi.getCommitDiffs(
           repositoryId,
           project,
-          diffCommonCommit,
-          top,
-          skip,
-          baseVersionDescriptor,
-          targetVersionDescriptor
+          true, // IMPORTANT: Include file content diffs to get line-by-line changes
+          maxFilesToProcess,
+          0,
+          { version: targetBranch, versionType: GitVersionType.Branch } as GitBaseVersionDescriptor, // base version (e.g., master)
+          { version: currentBranch, versionType: GitVersionType.Branch } as GitTargetVersionDescriptor  // target version (e.g., copilot)
         );
 
+        const branchInfo = {
+          currentBranch: currentBranch,
+          targetBranch: targetBranch,
+          currentCommit: currentCommitId,
+          targetCommit: targetCommitId,
+        };
+
+        if (!commitDiffs.changes || commitDiffs.changes.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  summary: {
+                    message: `No file changes found between '${targetBranch}' and '${currentBranch}'`,
+                    ...branchInfo,
+                    totalFiles: 0,
+                  },
+                  fileChanges: [],
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        // Filter out folders, submodules, and limit to actual files
+        const fileChanges = commitDiffs.changes
+          .filter(change => 
+            change.item && 
+            !change.item.isFolder && 
+            change.item.gitObjectType === GitObjectType.Blob // Only include actual files
+          )
+          .slice(0, maxFilesToProcess);
+
+        if (!includeContent) {
+          // Return just the file list and change types without detailed content
+          const result = {
+            summary: {
+              message: `Found ${fileChanges.length} file changes on branch '${currentBranch}' compared to '${targetBranch}'`,
+              ...branchInfo,
+              changeCounts: commitDiffs.changeCounts,
+              totalFiles: fileChanges.length,
+              allChangesIncluded: commitDiffs.allChangesIncluded,
+            },
+            fileChanges: fileChanges.map(change => ({
+              path: change.item!.path,
+              changeType: change.changeType,
+              gitObjectType: change.item!.gitObjectType,
+              url: change.item!.url,
+            })),
+          };
+
+          return {
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          };
+        }
+
+        // Get detailed file diffs with content
+        if (fileChanges.length === 0) {
+          // Show what kinds of changes were detected but filtered out
+          const allChanges = commitDiffs.changes || [];
+          const detectedChanges = allChanges.map(change => ({
+            path: change.item?.path || 'unknown',
+            isFolder: change.item?.isFolder || false,
+            gitObjectType: change.item?.gitObjectType || 'unknown',
+            changeType: change.changeType,
+          }));
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  summary: {
+                    message: "No file changes found - only non-file changes detected (folders, submodules, etc.)",
+                    ...branchInfo,
+                    totalFiles: 0,
+                    detectedChanges: detectedChanges,
+                  },
+                  fileChanges: [],
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        const fileDiffParams: FileDiffParams[] = fileChanges.map(change => ({
+          path: change.item!.path!,
+          originalPath: change.item!.path!,
+        }));
+
+        const fileDiffsCriteria: FileDiffsCriteria = {
+          baseVersionCommit: targetCommitId,     // target branch commit
+          targetVersionCommit: currentCommitId,  // current branch commit
+          fileDiffParams: fileDiffParams,
+        };
+
+        const fileDiffs = await gitApi.getFileDiffs(fileDiffsCriteria, project, repositoryId);
+
+        // Combine branch info, change info, and detailed file diffs
+        const result = {
+          summary: {
+            message: `Your changes on branch '${currentBranch}' compared to '${targetBranch}'`,
+            ...branchInfo,
+            changeCounts: commitDiffs.changeCounts,
+            totalFiles: fileDiffs.length,
+            allChangesIncluded: commitDiffs.allChangesIncluded,
+            purpose: "Use this data to review your feature branch changes against your developer checklist",
+          },
+          fileChanges: fileDiffs.map(fileDiff => {
+            // Find corresponding change info
+            const changeInfo = fileChanges.find(change => change.item?.path === fileDiff.path);
+
+            return {
+              path: fileDiff.path,
+              originalPath: fileDiff.originalPath,
+              changeType: changeInfo ? changeInfo.changeType : "unknown",
+              gitObjectType: changeInfo?.item?.gitObjectType,
+              url: changeInfo?.item?.url,
+              // Provide the line diff blocks which contain the actual changed lines
+              lineDiffBlocks: fileDiff.lineDiffBlocks,
+              // Summary of changes for quick review
+              changesSummary: {
+                totalBlocks: fileDiff.lineDiffBlocks?.length || 0,
+                hasChanges: (fileDiff.lineDiffBlocks?.length || 0) > 0,
+              }
+            };
+          }),
+        };
+
         return {
-          content: [{ type: "text", text: JSON.stringify(commitDiffs, null, 2) }],
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
       } catch (error) {
         return {
           content: [
             {
               type: "text",
-              text: `Error retrieving branch diff: ${error instanceof Error ? error.message : String(error)}`,
+              text: `Error retrieving current branch changes: ${error instanceof Error ? error.message : String(error)}`,
             },
           ],
           isError: true,
